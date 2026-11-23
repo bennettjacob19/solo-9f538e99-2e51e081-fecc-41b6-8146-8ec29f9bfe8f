@@ -6,6 +6,13 @@
 3. 并发写入竞争：判零之后写入非零数据，回收不得抹掉新数据
 4. 中断重跑：中断后原盘与已打的洞保留，重启可重新发起并继续回收
 5. API 层输入校验与路由行为（stdlib WSGI 入口）
+6. 坏块：注入读故障（重启仍在）、原写入入口修复（备用槽接替、
+   内容与映射落盘才算成功）、无空槽写入失败且坏块状态保留
+7. 并发修复：两坏块争最后一槽最多一个成功；槽等待写盘时其他块
+   照常读写、有空槽可修复另一坏块
+8. 修复失败 / 进程中断：未提交修复的块仍报读错、预留槽可再次分配；
+   重启沿用已提交的映射
+9. 回收跳过故障原位置；备用槽全零块打洞后槽仍归原块号
 """
 from __future__ import annotations
 
@@ -13,13 +20,22 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 
 from app.api import ApiCore, ApiError
-from app.constants import BLOCK_SIZE, STATE_DATA, STATE_HOLE, STATE_ZERO
-from app.disk import DiskImage, create_image
+from app.constants import BLOCK_SIZE, STATE_DATA, STATE_FAULTY, STATE_HOLE, STATE_ZERO
+from app.disk import (
+    AlreadyRemappedError,
+    DiskFaultError,
+    DiskImage,
+    NoSpareSlotError,
+    create_image,
+)
 from app.reclaim import ReclaimManager
 from app.server_stdlib import create_wsgi_app
 
@@ -46,9 +62,9 @@ class TestPresetImage(TempImageTestCase):
             self.assertEqual(disk.block_state(16), STATE_DATA)     # 16..23 非零
             self.assertEqual(disk.block_state(24), STATE_HOLE)     # 24..31 空洞
 
-            # 已分配的是 8 个零块 + 8 个非零块 = 16 * 4KiB
+            # 已分配的是 8 个零块 + 8 个非零块 = 16 * 4KiB（备用槽为空洞不占空间）
             self.assertEqual(disk.actual_bytes(), 16 * BLOCK_SIZE)
-            self.assertEqual(os.path.getsize(self.path), disk.capacity)
+            self.assertEqual(os.path.getsize(self.path), disk.physical_size)
         finally:
             disk.close()
 
@@ -80,7 +96,7 @@ class TestFullReclaim(TempImageTestCase):
             self.assertEqual(punched, sorted(zero_indices))
 
             # 容量不变、实占下降：8 个零块全部释放
-            self.assertEqual(os.path.getsize(self.path), disk.capacity)
+            self.assertEqual(os.path.getsize(self.path), disk.physical_size)
             self.assertEqual(disk.actual_bytes(), before - 8 * BLOCK_SIZE)
 
             # 打洞后块读值不变（零块读回仍全零，非零块原样）
@@ -286,7 +302,7 @@ class TestInterruptionAndRestart(TempImageTestCase):
             disk2 = DiskImage(self.path, 256)
             holes_after = [i for i in range(256) if disk2.block_state(i) == STATE_HOLE]
             self.assertGreaterEqual(len(holes_after), 64 + final["punched_blocks"])
-            self.assertEqual(os.path.getsize(self.path), capacity)
+            self.assertEqual(os.path.getsize(self.path), disk2.physical_size)
 
             # 重启后重新发起回收：跳过已有空洞，把剩余零块收完
             manager2 = ReclaimManager(disk2)
@@ -328,6 +344,356 @@ class TestInterruptionAndRestart(TempImageTestCase):
             self.assertEqual(again.actual_bytes(), 4 * BLOCK_SIZE)
         finally:
             again.close()
+
+
+def _payload(tag: bytes, fill: bytes = b"\x55") -> bytes:
+    return (tag + fill * BLOCK_SIZE)[:BLOCK_SIZE]
+
+
+class TestFaultInjection(TempImageTestCase):
+    def test_fault_read_error_and_restart_persistence(self):
+        disk = self.open_disk(32)
+        try:
+            disk.inject_fault(20)  # 非零数据块
+            with self.assertRaises(DiskFaultError):
+                disk.read_block(20)
+            self.assertEqual(disk.block_state(20), STATE_FAULTY)
+            # 幂等：重复注入不报错
+            disk.inject_fault(20)
+            # 其他块不受影响
+            self.assertEqual(disk.read_block(21)[:9], b"block-002")
+        finally:
+            disk.close()
+        # 重启后故障仍在
+        disk2 = DiskImage(self.path, 32)
+        try:
+            with self.assertRaises(DiskFaultError):
+                disk2.read_block(20)
+            self.assertEqual(disk2.remap_status()["unrepaired"], [20])
+        finally:
+            disk2.close()
+
+    def test_inject_on_remapped_block_rejected(self):
+        disk = self.open_disk(32)
+        try:
+            disk.inject_fault(20)
+            disk.write_block(20, _payload(b"FIXED"))
+            with self.assertRaises(AlreadyRemappedError):
+                disk.inject_fault(20)
+        finally:
+            disk.close()
+
+
+class TestRepair(TempImageTestCase):
+    def test_repair_via_original_write_entry_and_restart(self):
+        disk = self.open_disk(32)
+        new_value = _payload(b"REPAIRED-BLOCK-20")
+        try:
+            disk.inject_fault(20)
+            result = disk.write_block(20, new_value)  # 原写入入口触发修复
+            self.assertTrue(result["repaired"])
+            self.assertEqual(result["slot"], 0)
+            # 此后按原块号读写，透明落到备用槽
+            self.assertEqual(disk.read_block(20), new_value)
+            self.assertEqual(disk.block_state(20), STATE_DATA)
+            status = disk.remap_status()
+            self.assertEqual(status["mapping"], {"20": 0})
+            self.assertEqual(status["spare_free"], 1)
+            # 再写仍走备用槽
+            newer = _payload(b"SECOND-WRITE")
+            result2 = disk.write_block(20, newer)
+            self.assertFalse(result2["repaired"])
+            self.assertEqual(disk.read_block(20), newer)
+        finally:
+            disk.close()
+        # 重启沿用已提交的映射；故障标记也保留（原位置仍被回收跳过）
+        disk2 = DiskImage(self.path, 32)
+        try:
+            self.assertEqual(disk2.read_block(20), newer)
+            st = disk2.remap_status()
+            self.assertEqual(st["mapping"], {"20": 0})
+            self.assertEqual(st["faulty"], [20])
+            self.assertEqual(st["unrepaired"], [])
+            self.assertEqual(st["spare_free"], 1)
+        finally:
+            disk2.close()
+
+    def test_repair_failure_releases_slot_and_keeps_fault(self):
+        disk = self.open_disk(32)
+        try:
+            disk.inject_fault(20)
+            disk._slot_write_hook = lambda slot: (_ for _ in ()).throw(
+                RuntimeError("模拟写盘失败")
+            )
+            with self.assertRaises(RuntimeError):
+                disk.write_block(20, _payload(b"WONT-COMMIT"))
+            # 坏块状态保留，预留槽已释放
+            self.assertEqual(disk.block_state(20), STATE_FAULTY)
+            with self.assertRaises(DiskFaultError):
+                disk.read_block(20)
+            self.assertEqual(disk.remap_status()["spare_free"], 2)
+            # 解除故障注入后重试成功，拿到同一个槽
+            disk._slot_write_hook = None
+            result = disk.write_block(20, _payload(b"RETRY-OK"))
+            self.assertTrue(result["repaired"])
+            self.assertEqual(result["slot"], 0)
+            self.assertEqual(disk.read_block(20), _payload(b"RETRY-OK"))
+        finally:
+            disk.close()
+
+    def test_commit_persist_failure_keeps_fault_and_frees_slot(self):
+        """映射落盘失败：内存态一并回滚，块仍报读错，预留槽可再次分配。"""
+        disk = self.open_disk(32)
+        try:
+            disk.inject_fault(20)
+            orig_persist = disk._remap._persist_locked
+            disk._remap._persist_locked = lambda: (_ for _ in ()).throw(
+                OSError("模拟映射落盘失败")
+            )
+            with self.assertRaises(OSError):
+                disk.write_block(20, _payload(b"NO-COMMIT"))
+            # 内存态也回滚：块仍故障未修复，槽已释放
+            self.assertEqual(disk.block_state(20), STATE_FAULTY)
+            with self.assertRaises(DiskFaultError):
+                disk.read_block(20)
+            st = disk.remap_status()
+            self.assertEqual(st["spare_free"], 2)
+            self.assertEqual(st["mapping"], {})
+            # 恢复落盘后重试成功
+            disk._remap._persist_locked = orig_persist
+            result = disk.write_block(20, _payload(b"OK-AGAIN"))
+            self.assertTrue(result["repaired"])
+            self.assertEqual(disk.read_block(20), _payload(b"OK-AGAIN"))
+        finally:
+            disk.close()
+
+    def test_no_spare_slot_write_fails_and_fault_kept(self):
+        disk = self.open_disk(32)
+        try:
+            for b in (20, 21, 22):
+                disk.inject_fault(b)
+            disk.write_block(20, _payload(b"A"))
+            disk.write_block(21, _payload(b"B"))
+            # 两个备用槽已用完：第三个坏块写入失败，坏块状态保留
+            with self.assertRaises(NoSpareSlotError):
+                disk.write_block(22, _payload(b"C"))
+            self.assertEqual(disk.block_state(22), STATE_FAULTY)
+            with self.assertRaises(DiskFaultError):
+                disk.read_block(22)
+            st = disk.remap_status()
+            self.assertEqual(st["spare_free"], 0)
+            self.assertEqual(st["unrepaired"], [22])
+        finally:
+            disk.close()
+        # 重启后依旧：无空槽、坏块 22 仍报读错
+        disk2 = DiskImage(self.path, 32)
+        try:
+            with self.assertRaises(NoSpareSlotError):
+                disk2.write_block(22, _payload(b"C2"))
+            with self.assertRaises(DiskFaultError):
+                disk2.read_block(22)
+        finally:
+            disk2.close()
+
+
+class TestConcurrentRepair(TempImageTestCase):
+    def test_two_bad_blocks_race_for_last_slot(self):
+        """两个坏块争最后一个备用槽：最多一个修复成功。"""
+        disk = self.open_disk(32)
+        try:
+            disk.inject_fault(20)
+            disk.write_block(20, _payload(b"FIRST"))  # 占掉槽 0
+            disk.inject_fault(21)
+            disk.inject_fault(22)
+
+            barrier = threading.Barrier(2)
+            results, errors = {}, {}
+
+            def repair(b):
+                barrier.wait()
+                try:
+                    results[b] = disk.write_block(b, _payload(b"RACE-%d" % b))
+                except NoSpareSlotError as exc:
+                    errors[b] = exc
+
+            threads = [threading.Thread(target=repair, args=(b,)) for b in (21, 22)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+                self.assertFalse(t.is_alive())
+
+            # 恰好一个成功、一个因无空槽失败
+            self.assertEqual(len(results), 1)
+            self.assertEqual(len(errors), 1)
+            winner = next(iter(results))
+            loser = next(iter(errors))
+            self.assertEqual(results[winner]["slot"], 1)
+            self.assertEqual(disk.block_state(loser), STATE_FAULTY)
+            with self.assertRaises(DiskFaultError):
+                disk.read_block(loser)
+            st = disk.remap_status()
+            self.assertEqual(st["spare_free"], 0)
+            self.assertEqual(st["unrepaired"], [loser])
+        finally:
+            disk.close()
+
+    def test_others_unblocked_while_slot_write_in_flight(self):
+        """某槽等待写盘时：其他块照常读写，有空槽也能修复另一坏块。"""
+        disk = self.open_disk(32)
+        try:
+            for b in (20, 21, 22):
+                disk.inject_fault(b)
+
+            hook_entered = threading.Event()
+            release_hook = threading.Event()
+            first_call = threading.Event()
+
+            def hook(slot):
+                if not first_call.is_set():  # 只拖住第一个修复
+                    first_call.set()
+                    hook_entered.set()
+                    self.assertTrue(release_hook.wait(5))
+
+            disk._slot_write_hook = hook
+            outcome = {}
+
+            def repair_a():
+                outcome["a"] = disk.write_block(20, _payload(b"SLOW-A"))
+
+            t = threading.Thread(target=repair_a)
+            t.start()
+            self.assertTrue(hook_entered.wait(5))  # A 已占槽、正在等写盘
+
+            # 其他块照常读写（不被在途修复阻塞）
+            disk.write_block(10, _payload(b"HEALTHY"))
+            self.assertEqual(disk.read_block(10), _payload(b"HEALTHY"))
+            self.assertEqual(disk.read_block(0), b"\x00" * BLOCK_SIZE)
+
+            # 有空槽：另一坏块照常修复成功
+            res_b = disk.write_block(21, _payload(b"FAST-B"))
+            self.assertTrue(res_b["repaired"])
+            self.assertEqual(res_b["slot"], 1)
+
+            # 此时两槽俱占：第三个坏块修复失败
+            with self.assertRaises(NoSpareSlotError):
+                disk.write_block(22, _payload(b"NO-SLOT"))
+
+            release_hook.set()
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+            self.assertTrue(outcome["a"]["repaired"])
+            self.assertEqual(outcome["a"]["slot"], 0)
+
+            self.assertEqual(disk.read_block(20), _payload(b"SLOW-A"))
+            self.assertEqual(disk.read_block(21), _payload(b"FAST-B"))
+            self.assertEqual(disk.block_state(22), STATE_FAULTY)
+            st = disk.remap_status()
+            self.assertEqual(st["mapping"], {"20": 0, "21": 1})
+            self.assertEqual(st["spare_free"], 0)
+        finally:
+            disk.close()
+
+
+class TestRepairCrashRestart(TempImageTestCase):
+    def test_crash_before_commit_keeps_fault_and_frees_slot(self):
+        """进程在内容落盘后、映射提交前被杀：块仍报读错，槽可再次分配。"""
+        marker = os.path.join(self.tmp, "hook-ready")
+        payload_a = _payload(b"COMMITTED-A")
+        payload_b = _payload(b"UNCOMMITTED-B")
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        child_code = f"""
+import sys, time
+sys.path.insert(0, {repo_root!r})
+from app.disk import create_image
+disk = create_image({self.path!r}, 32)
+disk.inject_fault(20)
+disk.inject_fault(21)
+disk.write_block(20, {payload_a!r})  # 已提交：槽 0
+def hook(slot):
+    with open({marker!r}, "w") as fh:
+        fh.write("ready")
+    time.sleep(60)  # 在映射提交前一直挂起，等待被杀
+disk._slot_write_hook = hook
+disk.write_block(21, {payload_b!r})  # 内容落盘后、提交前被 SIGKILL
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-c", child_code],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            # 等子进程把块 21 的内容写入备用槽并挂起在提交前
+            for _ in range(200):
+                if os.path.exists(marker) or proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(marker), "子进程未进入提交前挂起点")
+            proc.kill()  # 模拟进程中断（SIGKILL）
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+        # 重启：已提交映射沿用，未提交的块仍报读错，预留槽可再次分配
+        disk = DiskImage(self.path, 32)
+        try:
+            self.assertEqual(disk.read_block(20), payload_a)  # 已提交映射生效
+            with self.assertRaises(DiskFaultError):
+                disk.read_block(21)  # 未提交修复：仍报读错
+            st = disk.remap_status()
+            self.assertEqual(st["mapping"], {"20": 0})
+            self.assertEqual(st["spare_free"], 1)  # 槽 1 未被占用
+            # 槽 1 可再次分配：重写块 21 修复成功
+            payload_b2 = _payload(b"RETRY-B")
+            result = disk.write_block(21, payload_b2)
+            self.assertTrue(result["repaired"])
+            self.assertEqual(result["slot"], 1)
+            self.assertEqual(disk.read_block(21), payload_b2)
+        finally:
+            disk.close()
+
+
+class TestReclaimWithFaults(TempImageTestCase):
+    def test_reclaim_skips_faulty_and_punches_spare_slots(self):
+        disk = self.open_disk(32)  # 零块 8..15，非零 16..23，备用槽 32..33
+        try:
+            disk.inject_fault(9)   # 故障零块：原位置不得被打洞
+            disk.inject_fault(16)  # 故障数据块，修复为非零 → 槽 0
+            disk.write_block(16, _payload(b"IN-SPARE-0"))
+            disk.inject_fault(17)  # 故障数据块，修复为全零 → 槽 1
+            disk.write_block(17, b"\x00" * BLOCK_SIZE)
+            before = disk.actual_bytes()
+
+            events = list(disk.reclaim())
+            by_index = {}
+            for e in events:
+                by_index.setdefault(e["index"], e)
+
+            # 故障原位置被跳过：不读不打洞，空间保留
+            self.assertEqual(by_index[9]["state"], STATE_FAULTY)
+            self.assertEqual(by_index[16]["state"], STATE_FAULTY)
+            self.assertEqual(by_index[17]["state"], STATE_FAULTY)
+            self.assertEqual(disk.block_state(9), STATE_FAULTY)
+            # 其他零块照常打洞
+            self.assertEqual(by_index[8]["state"], "punched")
+            # 备用槽：槽 0 非零保留，槽 1 全零被打洞
+            slot_events = {e["slot"]: e for e in events if "slot" in e}
+            self.assertEqual(slot_events[0]["state"], STATE_DATA)
+            self.assertEqual(slot_events[1]["state"], "punched")
+            # 打洞后槽仍归原块号，读回仍全零
+            st = disk.remap_status()
+            self.assertEqual(st["mapping"], {"16": 0, "17": 1})
+            self.assertEqual(disk.read_block(17), b"\x00" * BLOCK_SIZE)
+            self.assertEqual(disk.read_block(16), _payload(b"IN-SPARE-0"))
+            # 实占下降包含槽 1 释放的一个块
+            self.assertLessEqual(disk.actual_bytes(), before - BLOCK_SIZE)
+            # 已修复块仍可写：写入已打洞的槽会重新分配
+            disk.write_block(17, _payload(b"BACK-AGAIN"))
+            self.assertEqual(disk.read_block(17), _payload(b"BACK-AGAIN"))
+        finally:
+            disk.close()
 
 
 class TestApiCore(TempImageTestCase):
@@ -378,6 +744,42 @@ class TestApiCore(TempImageTestCase):
         self.assertEqual(self.core.get_block(0)["state"], STATE_HOLE)
         self.assertEqual(bytes.fromhex(self.core.get_block(0)["hex"]), b"\x00" * BLOCK_SIZE)
 
+    def test_fault_and_repair_via_api(self):
+        self.core.inject_fault(4)  # 16 块镜像：4..7 为写过的零块
+        with self.assertRaises(ApiError) as ctx:
+            self.core.read_block(4)
+        self.assertEqual(ctx.exception.status, 500)
+        self.assertIn("读故障", ctx.exception.message)
+
+        payload = _payload(b"API-REPAIR")
+        resp = self.core.write_block(4, {"hex": payload.hex()})
+        self.assertTrue(resp["repaired"])
+        self.assertEqual(resp["remapped_to"], 0)
+        self.assertEqual(bytes.fromhex(self.core.get_block(4)["hex"]), payload)
+
+        # 已修复块不在原位置，不能再注入故障
+        with self.assertRaises(ApiError) as ctx:
+            self.core.inject_fault(4)
+        self.assertEqual(ctx.exception.status, 409)
+
+        remap = self.core.status()["remap"]
+        self.assertEqual(remap["mapping"], {"4": 0})
+        self.assertEqual(remap["spare_free"], 1)
+        self.assertEqual(remap["unrepaired"], [])
+
+    def test_no_spare_slot_api_507(self):
+        for b in (4, 5, 6):
+            self.core.inject_fault(b)
+        ok = {"hex": _payload(b"X").hex()}
+        self.core.write_block(4, ok)
+        self.core.write_block(5, ok)
+        with self.assertRaises(ApiError) as ctx:
+            self.core.write_block(6, ok)
+        self.assertEqual(ctx.exception.status, 507)
+        remap = self.core.status()["remap"]
+        self.assertEqual(remap["spare_free"], 0)
+        self.assertEqual(remap["unrepaired"], [6])
+
     def test_wsgi_routing_and_errors(self):
         app = create_wsgi_app(self.core)
 
@@ -418,6 +820,24 @@ class TestApiCore(TempImageTestCase):
         code, body = call("POST", "/api/blocks/2/write-pattern/zero")
         self.assertEqual(code, 200)
         self.assertEqual(body["state"], STATE_ZERO)
+
+        # 注入故障 → 读 500；修复写 → 200 且带重映射信息
+        code, body = call("POST", "/api/blocks/3/fault")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["faulty"])
+        code, body = call("POST", "/api/blocks/3/read")
+        self.assertEqual(code, 500)
+        self.assertIn("读故障", body["error"])
+        code, body = call(
+            "POST", "/api/blocks/3/write",
+            json.dumps({"hex": _payload(b"WSGI-FIX").hex()}).encode(),
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(body["repaired"])
+        self.assertEqual(body["remapped_to"], 0)
+        code, body = call("GET", "/api/blocks/3")
+        self.assertEqual(code, 200)
+        self.assertEqual(bytes.fromhex(body["hex"]), _payload(b"WSGI-FIX"))
 
 
 if __name__ == "__main__":

@@ -53,6 +53,11 @@ def create_app(image_path: str | None = None, block_count: int = DEFAULT_BLOCK_C
     def write_block(index: int):
         return jsonify(core.write_block(index, request.get_json(silent=True) or {}))
 
+    @app.post("/api/blocks/<int:index>/fault")
+    def inject_fault(index: int):
+        # 对还在原位置的块注入读故障（落盘，重启仍在）
+        return jsonify(core.inject_fault(index))
+
     @app.post("/api/blocks/<int:index>/write-pattern/<kind>")
     def write_pattern(index: int, kind: str):
         return jsonify(core.write_pattern(index, kind))

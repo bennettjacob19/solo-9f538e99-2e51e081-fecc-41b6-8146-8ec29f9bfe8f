@@ -19,7 +19,7 @@ from .disk import create_image
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
 
-_BLOCK_RE = re.compile(r"^/api/blocks/(\d+)(/read|/write|/write-pattern/(zero|data))?$")
+_BLOCK_RE = re.compile(r"^/api/blocks/(\d+)(/read|/write|/fault|/write-pattern/(zero|data))?$")
 
 
 def create_wsgi_app(core: ApiCore):
@@ -71,6 +71,8 @@ def _route(environ, method: str, path: str, core: ApiCore):
         if suffix == "/write" and method == "POST":
             payload = _read_json(environ)
             return _json(core.write_block(index, payload)), 200, "application/json"
+        if suffix == "/fault" and method == "POST":
+            return _json(core.inject_fault(index)), 200, "application/json"
         if suffix.startswith("/write-pattern/") and method == "POST":
             return _json(core.write_pattern(index, match.group(3))), 200, "application/json"
 
@@ -99,7 +101,14 @@ def _serve_static(name: str) -> bytes:
 
 
 def _reason(code: int) -> str:
-    return {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}.get(code, "OK")
+    return {
+        200: "OK",
+        400: "Bad Request",
+        404: "Not Found",
+        409: "Conflict",
+        500: "Internal Server Error",
+        507: "Insufficient Storage",
+    }.get(code, "OK")
 
 
 def main() -> None:

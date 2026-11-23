@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-from .constants import STATE_DATA, STATE_HOLE
+from .constants import STATE_DATA, STATE_FAULTY, STATE_HOLE
 from .disk import DiskImage
 
 
@@ -27,6 +27,7 @@ class ReclaimManager:
         self._scanned = 0
         self._punched = 0
         self._skipped_data = 0
+        self._skipped_faulty = 0
         self._last_index = -1
         self._error: Optional[str] = None
         self._actual_before = self.disk.actual_bytes()
@@ -67,7 +68,10 @@ class ReclaimManager:
                         self._scanned += 1
                         if state == STATE_DATA:
                             self._skipped_data += 1
-                    # "stopped" 事件不增加计数
+                    elif state == STATE_FAULTY:
+                        self._scanned += 1
+                        self._skipped_faulty += 1
+                    # "stopped" / "reserved" 事件不增加计数
         except Exception as exc:  # noqa: BLE001 - 任何异常都回传网页
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -90,11 +94,12 @@ class ReclaimManager:
             "scanned_blocks": self._scanned,
             "punched_blocks": self._punched,
             "skipped_data_blocks": self._skipped_data,
+            "skipped_faulty_blocks": self._skipped_faulty,
             "last_index": self._last_index,
             "actual_bytes_before": self._actual_before,
             "actual_bytes_now": actual,
             "reclaimed_bytes": max(reclaimed, 0),
-            "total_blocks": self.disk.block_count,
+            "total_blocks": self.disk.block_count + self.disk.spare_count,
         }
 
     def state(self) -> dict:

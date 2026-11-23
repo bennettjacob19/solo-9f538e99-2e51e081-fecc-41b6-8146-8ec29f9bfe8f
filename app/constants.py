@@ -7,6 +7,9 @@ BLOCK_SIZE = 4096
 # 预置 raw 镜像默认包含的 4 KiB 块数（256 * 4KiB = 1 MiB）
 DEFAULT_BLOCK_COUNT = 256
 
+# 数据卷上的备用槽个数：坏块修复时由备用槽接替原位置，只有 2 个
+DEFAULT_SPARE_COUNT = 2
+
 # 回收线程每打多少个洞做一次 fsync，保证中断后已打的洞落盘
 FSYNC_EVERY_PUNCHES = 32
 
@@ -21,3 +24,4 @@ FALLOC_FL_PUNCH_HOLE = 0x02
 STATE_HOLE = "hole"        # 稀疏空洞，不占宿主盘空间，读为全零
 STATE_ZERO = "zero"        # 已分配且内容全零（写过的零块，占空间、可回收）
 STATE_DATA = "data"        # 已分配且含非零数据
+STATE_FAULTY = "faulty"    # 注入读故障且尚未修复的块（读请求报错）

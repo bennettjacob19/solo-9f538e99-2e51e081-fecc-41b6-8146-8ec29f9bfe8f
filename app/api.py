@@ -4,7 +4,12 @@ from __future__ import annotations
 import binascii
 
 from .constants import BLOCK_SIZE
-from .disk import DiskImage
+from .disk import (
+    AlreadyRemappedError,
+    DiskFaultError,
+    DiskImage,
+    NoSpareSlotError,
+)
 from .reclaim import ReclaimManager
 
 
@@ -29,7 +34,10 @@ class ApiCore:
     # -- GET /api/blocks/<i> ------------------------------------------------
     def get_block(self, index: int) -> dict:
         self._check_index(index)
-        data = self.disk.read_block(index)
+        try:
+            data = self.disk.read_block(index)
+        except DiskFaultError as exc:
+            raise ApiError(500, str(exc))
         return {
             "index": index,
             "state": self.disk.block_state(index),
@@ -54,9 +62,28 @@ class ApiCore:
             raise ApiError(
                 400, f"一次写入必须恰好 {BLOCK_SIZE} 字节，收到 {len(data)} 字节"
             )
-        # 正常读写不等待回收扫描：块锁只在单个 4KiB 操作期间持有
-        self.disk.write_block(index, data)
-        return {"index": index, "written_bytes": BLOCK_SIZE, "state": self.disk.block_state(index)}
+        # 正常读写不等待回收扫描：块锁只在单个 4KiB 操作期间持有。
+        # 故障块在此透明修复：备用槽接替原位置，内容与映射都落盘才返回。
+        try:
+            result = self.disk.write_block(index, data)
+        except NoSpareSlotError as exc:
+            raise ApiError(507, str(exc))
+        return {
+            "index": index,
+            "written_bytes": BLOCK_SIZE,
+            "state": self.disk.block_state(index),
+            "remapped_to": result["slot"],
+            "repaired": result["repaired"],
+        }
+
+    # -- POST /api/blocks/<i>/fault：对还在原位置的块注入读故障 ---------------
+    def inject_fault(self, index: int) -> dict:
+        self._check_index(index)
+        try:
+            self.disk.inject_fault(index)
+        except AlreadyRemappedError as exc:
+            raise ApiError(409, str(exc))
+        return {"index": index, "faulty": True, "remap": self.disk.remap_status()}
 
     # -- POST /api/reclaim/start、/cancel -----------------------------------
     def reclaim_start(self) -> dict:
@@ -75,8 +102,16 @@ class ApiCore:
             data = (marker + b"\x5a" * BLOCK_SIZE)[:BLOCK_SIZE]
         else:
             raise ApiError(400, "未知 pattern，仅支持 zero / data")
-        self.disk.write_block(index, data)
-        return {"index": index, "state": self.disk.block_state(index)}
+        try:
+            result = self.disk.write_block(index, data)
+        except NoSpareSlotError as exc:
+            raise ApiError(507, str(exc))
+        return {
+            "index": index,
+            "state": self.disk.block_state(index),
+            "remapped_to": result["slot"],
+            "repaired": result["repaired"],
+        }
 
     def _check_index(self, index: int) -> None:
         if not isinstance(index, int) or not (0 <= index < self.disk.block_count):

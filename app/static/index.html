@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>虚拟盘零块回收演示</title>
+  <title>虚拟盘零块回收 + 坏块修复</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 <header>
-  <h1>虚拟盘零块回收（4 KiB 块 / raw 稀疏镜像）</h1>
-  <p class="hint">空洞不占宿主空间；写过的零块占空间但可打洞回收；打洞不改容量、不改读值。</p>
+  <h1>虚拟盘零块回收 + 坏块备用槽修复（4 KiB 块 / raw 稀疏镜像）</h1>
+  <p class="hint">空洞不占宿主空间；写过的零块占空间但可打洞回收；故障块读报错，
+    经原写入入口写满新值后由备用槽接替原位置（内容与映射都落盘才算成功）。</p>
 </header>
 
 <section class="cards">
@@ -17,12 +18,28 @@
   <div class="card"><div class="label">逻辑容量</div><div id="f-capacity" class="num">-</div></div>
   <div class="card"><div class="label">宿主实占字节</div><div id="f-actual" class="num highlight">-</div></div>
   <div class="card"><div class="label">已回收字节</div><div id="f-reclaimed" class="num ok">-</div></div>
+  <div class="card"><div class="label">空闲备用槽</div><div id="f-spare" class="num spare">-</div></div>
 </section>
 
 <section class="legend">
   <span><i class="sw hole"></i>空洞 hole（不占空间）</span>
   <span><i class="sw zero"></i>写过的零块 zero（可回收）</span>
   <span><i class="sw data"></i>非零块 data</span>
+  <span><i class="sw faulty"></i>故障块 faulty（读报错）</span>
+  <span><i class="sw remapped"></i>已修复（备用槽接替）</span>
+</section>
+
+<section class="panel">
+  <h2>坏块与备用槽</h2>
+  <div class="row">
+    <span class="state">空闲备用槽 <b id="spare-free">-</b> / <span id="spare-total">-</span>
+      ；故障块经原写入入口写满新值后由空闲备用槽接替，无空槽时写入失败、坏块状态保留</span>
+  </div>
+  <div id="slots" class="slots"></div>
+  <table class="kv">
+    <tr><td>故障块（未修复）</td><td id="faulty-list" class="mono">-</td></tr>
+    <tr><td>重映射去向（块 → 备用槽）</td><td id="mapping-list" class="mono">-</td></tr>
+  </table>
 </section>
 
 <section class="panel">
@@ -40,6 +57,7 @@
     <tr><td>已扫描（已分配）块</td><td id="r-scanned" class="mono">0</td></tr>
     <tr><td>已打洞块</td><td id="r-punched" class="mono">0</td></tr>
     <tr><td>跳过的非零块</td><td id="r-skipped" class="mono">0</td></tr>
+    <tr><td>跳过的故障原位置</td><td id="r-faulty" class="mono">0</td></tr>
     <tr><td>回收前实占 / 当前实占</td><td id="r-before-after" class="mono">- / -</td></tr>
     <tr><td>错误</td><td id="r-error" class="mono err">-</td></tr>
   </table>
@@ -57,6 +75,7 @@
     <button id="btn-write-zero">写全零块</button>
     <button id="btn-write-data">写非零图案</button>
     <button id="btn-write-hex">按 Hex 写入</button>
+    <button id="btn-fault" class="danger">注入读故障</button>
   </div>
   <textarea id="hex-input" rows="3" placeholder="十六进制输入，需恰好 8192 个 hex 字符（4096 字节）"></textarea>
   <div class="block-view">

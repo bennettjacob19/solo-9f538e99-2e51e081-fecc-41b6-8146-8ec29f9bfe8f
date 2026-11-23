@@ -23,7 +23,8 @@ def main() -> None:
         snap = disk.stats()
         print(
             f"镜像就绪: {snap['path']} 容量={snap['capacity_bytes']}B "
-            f"实占={snap['actual_bytes']}B 块数={snap['block_count']}"
+            f"实占={snap['actual_bytes']}B 块数={snap['block_count']} "
+            f"备用槽={snap['spare_count']}"
         )
         disk.close()
     elif cmd == "serve":
